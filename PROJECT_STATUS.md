@@ -1,5 +1,23 @@
 # Reddit Insights status
 
+## Revoked derivative cleanup — October 26, 2026
+
+Snapshot publication records up to 4,096 revoked derivative keys in the private
+catalog. Normal publication preserves that content-free journal without deleting
+objects. The explicit `--delete-revoked` publisher option removes only journaled,
+non-active derivative objects after verifying the published catalog. Interrupted
+cleanup retains the journal for an idempotent retry; raw archive keys are rejected.
+The existing serialized snapshot-publication workflow remains required.
+
+Synthetic storage tests cover redacted source projection, replacement publication,
+physical old-export removal, revoked pinned downloads, sanitized JSON/CSV, failed
+readback/deletion and retries. Production cleanup has not been activated, and the
+48-hour deletion acceptance remains unqualified. Previously orphaned derivatives
+are not discovered by this journal. Collector/raw-archive ownership, historical
+redaction and authorization remain open in [#44](https://github.com/sarthakagrawal927/research-subreddit/issues/44).
+
+## Prior deployed snapshot release
+
 Updated October 2, 2026. Tracking: [snapshot feature #21](https://github.com/High-Signal-App/research-subreddit/issues/21).
 
 Snapshot Studio is live at https://reddit-insights.highsignal.app/. At final

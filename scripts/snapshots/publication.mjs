@@ -5,6 +5,8 @@ import { validDate } from "./viewer/paths.mjs";
 export const EXPORT_PREFIX = "reddit-insights/exports/v1/";
 export const LEASE_MS = 86400000;
 export const RETOUCH_MS = 5 * LEASE_MS;
+export const MAX_PENDING_DELETIONS = 4096;
+const MAX_CATALOG_BYTES = 4 * 1024 * 1024;
 
 export function archivePrefix(entry) {
   if (!validDate(entry.date) || !/^[1-9][0-9]*$/.test(entry.source?.run || "") || !/^[1-9][0-9]*$/.test(entry.source?.attempt || "")) throw new Error("Invalid source archive identity");
@@ -21,6 +23,12 @@ export function verifyCatalog(catalog) {
       || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0 || entry.bytes > MAX_SNAPSHOT_BYTES || keys.has(entry.key)) throw new Error("Invalid catalogued export");
     keys.add(entry.key);
   }
+  const pending = catalog.pendingDeletionKeys ?? [];
+  if (!Array.isArray(pending) || pending.length > MAX_PENDING_DELETIONS || new Set(pending).size !== pending.length) throw new Error("Invalid pending deletion journal");
+  for (const key of pending) {
+    const match = typeof key === "string" && /^snapshots\/(\d{4}-\d{2}-\d{2})\/[A-Za-z0-9_]{2,30}\/[1-9][0-9]*-[a-f0-9]{64}\.json\.gz$/.exec(key);
+    if (!match || !validDate(match[1]) || keys.has(key)) throw new Error("Deletion journal contains an invalid or active export key");
+  }
   return catalog;
 }
 
@@ -36,9 +44,18 @@ export function prepareSnapshots(snapshots, now = Date.now()) {
   });
 }
 
+export function replaceSourceEntries(catalog, entries) {
+  verifyCatalog(catalog);
+  const prefixes = new Set(entries.map(archivePrefix));
+  const next = [...catalog.entries.filter(entry => !prefixes.has(archivePrefix(entry))), ...entries];
+  const active = new Set(next.map(entry => entry.key));
+  const retired = catalog.entries.filter(entry => !active.has(entry.key)).map(entry => entry.key);
+  const pending = [...new Set([...(catalog.pendingDeletionKeys || []), ...retired])];
+  return verifyCatalog({ ...catalog, entries: next, ...(pending.length ? { pendingDeletionKeys: pending } : {}) });
+}
+
 export function replaceSource(catalog, prepared) {
-  const prefixes = new Set(prepared.map(item => archivePrefix(item.entry)));
-  return { schema: "reddit-insights.catalog.v1", entries: [...catalog.entries.filter(entry => !prefixes.has(archivePrefix(entry))), ...prepared.map(item => item.entry)] };
+  return replaceSourceEntries(catalog, prepared.map(item => item.entry));
 }
 
 /** Lease renewal is permitted only after rereading the authoritative manifest. */
@@ -85,13 +102,36 @@ export async function refreshSourceExports(entries, manifestBytes, load, read, n
 }
 
 /** Catalog is committed last; interrupted object uploads cannot switch readers. */
-export async function publishPrepared(catalog, prepared, put, verify) {
+export async function publishPrepared(catalog, prepared, put, verify, { remove, readCatalog } = {}) {
   verifyCatalog(catalog);
+  const pending = catalog.pendingDeletionKeys || [];
+  if (remove && pending.length && !readCatalog) throw new Error("Deletion requires catalog readback verification");
+  const encode = value => {
+    const bytes = Buffer.from(JSON.stringify(verifyCatalog(value)));
+    if (bytes.length > MAX_CATALOG_BYTES) throw new Error("Catalog exceeds serving limit");
+    return bytes;
+  };
+  const catalogBytes = encode(catalog);
   for (let start = 0; start < prepared.length; start += 4) {
     const results = await Promise.allSettled(prepared.slice(start, start + 4).map(item => put(EXPORT_PREFIX + item.entry.key, item.bytes)));
     const failed = results.find(result => result.status === "rejected");
     if (failed) throw failed.reason;
   }
   if (prepared.length) await verify(prepared.find(item => item.entry.subreddit === "AI_Agents") || prepared[0]);
-  await put(EXPORT_PREFIX + "index.json", Buffer.from(JSON.stringify(verifyCatalog(catalog))));
+  await put(EXPORT_PREFIX + "index.json", catalogBytes);
+  if (!remove || !pending.length) return catalog;
+  const receipt = await readCatalog();
+  if (!receipt || !Buffer.from(receipt).equals(catalogBytes)) throw new Error("Published deletion journal readback failed");
+  for (let start = 0; start < pending.length; start += 4) {
+    const results = await Promise.allSettled(pending.slice(start, start + 4).map(key => remove(EXPORT_PREFIX + key)));
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+  const clean = { ...catalog };
+  delete clean.pendingDeletionKeys;
+  const cleanBytes = encode(clean);
+  await put(EXPORT_PREFIX + "index.json", cleanBytes);
+  const finalReceipt = await readCatalog();
+  if (!finalReceipt || !Buffer.from(finalReceipt).equals(cleanBytes)) throw new Error("Deletion completion readback failed");
+  return clean;
 }

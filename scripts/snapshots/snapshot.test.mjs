@@ -3,6 +3,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { projectArchive, verifyFile, sha256 } from "./archive.mjs";
 import { csv, readBounded, serveSnapshot } from "./service.mjs";
+import { EXPORT_PREFIX, prepareSnapshots, replaceSource, publishPrepared } from "./publication.mjs";
 import { onRequest } from "../../functions/api/snapshots/[[path]].js";
 
 const post = { id: "post1", subreddit: "Cloud", title: "=unsafe <script>text</script>", body: "A complete body\nwith commas, and \"quotes\".", permalink: "/r/Cloud/comments/post1/example/", author: "PRIVATE_AUTHOR", createdUtc: 1790784000, edited: false, score: 4, upvoteRatio: .8, commentCount: 3, flair: null, nsfw: false, spoiler: false, stickied: false, locked: false, archived: false, removalState: null, retrievedAt: "2026-10-01T00:20:00Z", rawPayloadHash: "PRIVATE_HASH" };
@@ -150,4 +151,35 @@ test("Pages adapter serves the catalog from the colo cache after the first read"
   await onRequest(context("catalog?v=abc"));
   await onRequest(context("2026-10-01/cloud"));
   assert.equal(entries.size, 1, "only the bare catalog URL is cached");
+});
+
+
+test("redacted source publication removes the revoked export bytes and denies pinned downloads", async () => {
+  const original = prepareSnapshots(projectArchive(fixture()), now);
+  const initial = { schema: "reddit-insights.catalog.v1", entries: original.map(item => item.entry) };
+  const objects = new Map([[EXPORT_PREFIX + "index.json", Buffer.from(JSON.stringify(initial))],
+    ...original.map(item => [EXPORT_PREFIX + item.entry.key, item.bytes])]);
+  const rawKey = "reddit/v2/run=123/attempt=1/date=2026-10-01/posts.jsonl.zst";
+  objects.set(rawKey, Buffer.from("raw archive remains outside derivative cleanup"));
+  const read = async key => objects.has(EXPORT_PREFIX + key) ? new Blob([objects.get(EXPORT_PREFIX + key)]).stream() : null;
+  const before = await serveSnapshot(request("2026-10-01/cloud?format=posts.csv"), read, now);
+  assert.match(await before.text(), /A complete body/);
+  const revised = prepareSnapshots(projectArchive({ ...fixture({ removed: true }), revision: "b".repeat(64) }), now);
+  const catalog = replaceSource(initial, revised);
+  await publishPrepared(catalog, revised,
+    async (key, bytes) => { objects.set(key, bytes); },
+    async item => assert.equal(sha256(objects.get(EXPORT_PREFIX + item.entry.key)), item.entry.sha256),
+    { remove: async key => { objects.delete(key); }, readCatalog: async () => objects.get(EXPORT_PREFIX + "index.json") });
+  assert.equal(objects.has(EXPORT_PREFIX + original[0].entry.key), false);
+  assert.equal(objects.has(rawKey), true);
+  const pinned = await serveSnapshot(request(`2026-10-01/cloud?revision=${"a".repeat(64)}&format=posts.csv`), read, now);
+  assert.equal(pinned.status, 410);
+  assert.equal(pinned.headers.get("Cache-Control"), "no-store");
+  for (const format of ["json", "posts.csv", "comments.csv"]) {
+    const response = await serveSnapshot(request(`2026-10-01/cloud?format=${format}`), read, now);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /\[removed\]/);
+    assert.doesNotMatch(body, /A complete body|@SUM/);
+  }
 });

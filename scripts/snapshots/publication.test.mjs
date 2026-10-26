@@ -18,9 +18,9 @@ test("publication rejects arbitrary archive identities and renews only unchanged
   assert.equal(renewSource([matching], Buffer.from('{}')), null);
 });
 test("changed source replaces all its old community revisions while preserving other dates", () => {
-  const other = { ...entry, date: "2026-09-30" };
-  const prepared = [{ bytes, entry: { ...entry, source: { ...source, revision: "b".repeat(64) } } }];
-  const result = replaceSource({ entries: [entry, other] }, prepared);
+  const other = { ...entry, date: "2026-09-30", key: entry.key.replace("2026-10-01", "2026-09-30") };
+  const prepared = [{ bytes, entry: { ...entry, source: { ...source, revision: "b".repeat(64) }, key: entry.key.replace(source.revision, "b".repeat(64)) } }];
+  const result = replaceSource({ schema: "reddit-insights.catalog.v1", entries: [entry, other] }, prepared);
   assert.deepEqual(result.entries, [other, prepared[0].entry]);
 });
 test("catalog publication follows uploads and verification; either failure leaves the old catalog active", async () => {

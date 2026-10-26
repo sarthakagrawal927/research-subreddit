@@ -7,13 +7,14 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadArchive, sha256 } from "./snapshots/archive.mjs";
-import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, renewSource, refreshSourceExports, publishPrepared } from "./snapshots/publication.mjs";
+import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, replaceSourceEntries, renewSource, refreshSourceExports, publishPrepared } from "./snapshots/publication.mjs";
 import { createWranglerRunner } from "./snapshots/wrangler-client.mjs";
 
 const exec = promisify(execFile);
 const { values } = parseArgs({ options: {
   "archive-dir": { type: "string", multiple: true }, "refresh-only": { type: "boolean", default: false },
   "rebuild-existing": { type: "boolean", default: false },
+  "delete-revoked": { type: "boolean", default: false },
   initialize: { type: "boolean", default: false }, bucket: { type: "string", default: "reddit-insights-archive" },
 } });
 if (!values["archive-dir"]?.length && !values["refresh-only"]) throw new Error("Provide --archive-dir or --refresh-only");
@@ -92,17 +93,21 @@ try {
     const refreshed = await refreshSourceExports(entries, manifest,
       () => downloadArchive(prefix, directory, manifest),
       entry => get(values.bucket, EXPORT_PREFIX + entry.key, join(work, `retouch-${serial++}`), true), now, { rebuildExisting: values["rebuild-existing"] });
-    catalog.entries = [...catalog.entries.filter(entry => archivePrefix(entry) !== prefix), ...refreshed.entries];
+    catalog = replaceSourceEntries(catalog, refreshed.entries);
     prepared.push(...refreshed.prepared);
   }
   catalog.generatedAt = new Date(now).toISOString();
   catalog.entries.sort((a, b) => b.date.localeCompare(a.date) || b.capturedAt.localeCompare(a.capturedAt) || a.subreddit.localeCompare(b.subreddit));
-  await publishPrepared(catalog, prepared, put, async item => {
+  catalog = await publishPrepared(catalog, prepared, put, async item => {
     const bytes = await get(values.bucket, EXPORT_PREFIX + item.entry.key, join(work, "verified-canary.json.gz"));
     if (bytes.length !== item.entry.bytes || sha256(bytes) !== item.entry.sha256) throw new Error("Published derivative readback failed");
-  });
+  }, values["delete-revoked"] ? {
+    remove: key => wrangler(["r2", "object", "delete", `${values.bucket}/${key}`, "--remote"]),
+    readCatalog: () => get(values.bucket, EXPORT_PREFIX + "index.json", join(work, `deletion-receipt-${serial++}.json`)),
+  } : {});
   const receipt = await get(values.bucket, EXPORT_PREFIX + "index.json", join(work, "verified-catalog.json"));
   if (!receipt.equals(Buffer.from(JSON.stringify(catalog)))) throw new Error("Published catalog readback failed");
+  console.log(`Pending revoked derivative objects: ${catalog.pendingDeletionKeys?.length || 0}; physical cleanup requires --delete-revoked.`);
   console.log(`Verified ${catalog.entries.length} private snapshots; ${uploads} writes. Serving leases expire after24h without an authoritative refresh.`);
 } finally {
   // This process-created scratch directory contains temporary packs only.
