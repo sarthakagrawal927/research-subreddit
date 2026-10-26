@@ -115,7 +115,18 @@ test("a full journal can drain before another source replacement instead of wedg
   const f = fixture(1);
   const previous = { schema: "reddit-insights.catalog.v1", entries: f.entries,
     pendingDeletionKeys: Array.from({ length: MAX_PENDING_DELETIONS }, (_, index) => `snapshots/2026-09-30/Retired_${index}/11-${"c".repeat(64)}.json.gz`) };
-  assert.throws(() => replaceSourceEntries(previous, f.prepared.map(item => item.entry)), /journal is full/);
+  const ordinary = await replaceSourceWithCheckpoint(previous, f.prepared.map(item => item.entry));
+  assert.equal(ordinary.pendingDeletionOverflow, true);
+  assert.equal(ordinary.pendingDeletionKeys.length, MAX_PENDING_DELETIONS);
+  await publishPrepared(ordinary, f.prepared, f.put, f.verify);
+  assert.deepEqual(f.current().entries, f.prepared.map(item => item.entry));
+  assert.equal(f.current().pendingDeletionOverflow, true);
+  const renewed = await replaceSourceWithCheckpoint(ordinary, ordinary.entries.map(entry => ({ ...entry, expiresAt: "2026-10-28T00:00:00Z" })));
+  await publishPrepared(renewed, [], f.put, f.verify);
+  assert.equal(f.current().entries[0].expiresAt, "2026-10-28T00:00:00Z");
+  let unsafeDeletes = 0;
+  await assert.rejects(publishPrepared(ordinary, [], f.put, f.verify, { remove: async () => { unsafeDeletes++; }, readCatalog: f.readCatalog }), /reconcile overflow/);
+  assert.equal(unsafeDeletes, 0);
   let checkpoints = 0, deletes = 0;
   const catalog = await replaceSourceWithCheckpoint(previous, f.prepared.map(item => item.entry), async current => {
     checkpoints++;

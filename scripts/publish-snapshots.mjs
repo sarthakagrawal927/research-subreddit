@@ -118,7 +118,11 @@ try {
   catalog = await checkpoint(catalog);
   const receipt = await get(values.bucket, EXPORT_PREFIX + "index.json", join(work, "verified-catalog.json"));
   if (!receipt.equals(Buffer.from(JSON.stringify(catalog)))) throw new Error("Published catalog readback failed");
-  console.log(`Pending revoked derivative objects: ${catalog.pendingDeletionKeys?.length || 0}; physical cleanup requires --delete-revoked.`);
+  if (catalog.pendingDeletionOverflow) {
+    console.error("Revocation journal overflow: publication completed, but deletion reconciliation is incomplete (#44).");
+    process.exitCode = 1;
+  }
+  console.log(`Pending revoked derivative objects: ${catalog.pendingDeletionKeys?.length || 0}; physical cleanup unavailable until an exclusive transport exists (#44).`);
   console.log(`Verified ${catalog.entries.length} private snapshots; ${uploads} writes. Serving leases expire after24h without an authoritative refresh.`);
 } finally {
   // This process-created scratch directory contains temporary packs only.

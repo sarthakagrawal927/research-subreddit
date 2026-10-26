@@ -9,8 +9,11 @@ Wrangler transport has no enforced cross-publisher exclusion. Catalog readback
 alone cannot prevent a concurrent publisher from reactivating a key before deletion.
 The cleanup engine requires an exclusive transport before production integration.
 Its bounded checkpoint path drains a full journal before adding new replacements;
-reactivated keys are removed from the journal. A full journal without cleanup
-fails publication explicitly rather than silently losing deletion obligations.
+reactivated keys are removed from the journal. Without cleanup, overflow retains the first 4,096 keys and an explicit incomplete-
+reconciliation marker. Publication and lease renewals continue; the CLI exits
+nonzero after publication, and cleanup refuses an incomplete journal.
+Unconditional concurrent catalog writes can also lose journal entries: complete
+journal capture requires exclusive publication, not just safe deletion.
 
 Synthetic exclusive-storage tests cover redacted source projection, replacement
 publication, physical old-export removal, revoked pinned downloads, sanitized

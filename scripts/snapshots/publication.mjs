@@ -28,6 +28,7 @@ export function verifyCatalog(catalog) {
       || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0 || entry.bytes > MAX_SNAPSHOT_BYTES || keys.has(entry.key)) throw new Error("Invalid catalogued export");
     keys.add(entry.key);
   }
+  if (catalog.pendingDeletionOverflow !== undefined && catalog.pendingDeletionOverflow !== true) throw new Error("Invalid deletion overflow marker");
   const pending = catalog.pendingDeletionKeys ?? [];
   if (!Array.isArray(pending) || pending.length > MAX_PENDING_DELETIONS || new Set(pending).size !== pending.length) throw new Error("Invalid pending deletion journal");
   for (const key of pending) {
@@ -55,9 +56,9 @@ export function replaceSourceEntries(catalog, entries) {
   const active = new Set(next.map(entry => entry.key));
   const retired = catalog.entries.filter(entry => !active.has(entry.key)).map(entry => entry.key);
   const pending = [...new Set([...(catalog.pendingDeletionKeys || []), ...retired])].filter(key => !active.has(key));
-  if (pending.length > MAX_PENDING_DELETIONS) throw Object.assign(new Error("Revoked export journal is full; run publisher with --delete-revoked to checkpoint bounded cleanup"), { code: "pending_deletion_limit" });
   const result = { ...catalog, entries: next };
-  if (pending.length) result.pendingDeletionKeys = pending;
+  if (pending.length > MAX_PENDING_DELETIONS) result.pendingDeletionOverflow = true;
+  if (pending.length) result.pendingDeletionKeys = pending.slice(0, MAX_PENDING_DELETIONS);
   else delete result.pendingDeletionKeys;
   return verifyCatalog(result);
 }
@@ -68,11 +69,11 @@ export function replaceSource(catalog, prepared) {
 
 /** Explicit cleanup can checkpoint prior work before adding another bounded source. */
 export async function replaceSourceWithCheckpoint(catalog, entries, checkpoint) {
-  try { return replaceSourceEntries(catalog, entries); }
-  catch (error) {
-    if (error.code !== "pending_deletion_limit" || !checkpoint) throw error;
+  const next = replaceSourceEntries(catalog, entries);
+  if (next.pendingDeletionOverflow && !catalog.pendingDeletionOverflow && checkpoint) {
     return replaceSourceEntries(await checkpoint(catalog), entries);
   }
+  return next;
 }
 
 /** Lease renewal is permitted only after rereading the authoritative manifest. */
@@ -122,6 +123,7 @@ export async function refreshSourceExports(entries, manifestBytes, load, read, n
 export async function publishPrepared(catalog, prepared, put, verify, { remove, readCatalog } = {}) {
   verifyCatalog(catalog);
   const pending = catalog.pendingDeletionKeys || [];
+  if (remove && catalog.pendingDeletionOverflow) throw new Error("Deletion journal is incomplete; reconcile overflow before cleanup");
   if (remove && pending.length && !readCatalog) throw new Error("Deletion requires catalog readback verification");
   const encode = value => {
     const bytes = Buffer.from(JSON.stringify(verifyCatalog(value)));
