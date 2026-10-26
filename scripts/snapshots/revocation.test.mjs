@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { sha256 } from "./archive.mjs";
-import { EXPORT_PREFIX, MAX_PENDING_DELETIONS, replaceSource, verifyCatalog, publishPrepared } from "./publication.mjs";
+import { EXPORT_PREFIX, MAX_PENDING_DELETIONS, replaceSource, replaceSourceEntries, replaceSourceWithCheckpoint, verifyCatalog, publishPrepared } from "./publication.mjs";
 
 function fixture(count = 2) {
   const bytes = gzipSync("{}"), source = { run: "12", attempt: "1", revision: "a".repeat(64) };
@@ -108,4 +108,30 @@ test("cleanup requires readback and completion-write failure keeps retry evidenc
   assert.deepEqual(f.current().pendingDeletionKeys, f.entries.map(entry => entry.key));
   await publishPrepared(f.current(), [], f.put, f.verify, { remove: async key => { f.objects.delete(key); }, readCatalog: f.readCatalog });
   assert.equal(f.current().pendingDeletionKeys, undefined);
+});
+
+
+test("a full journal can drain before another source replacement instead of wedging recovery", async () => {
+  const f = fixture(1);
+  const previous = { schema: "reddit-insights.catalog.v1", entries: f.entries,
+    pendingDeletionKeys: Array.from({ length: MAX_PENDING_DELETIONS }, (_, index) => `snapshots/2026-09-30/Retired_${index}/11-${"c".repeat(64)}.json.gz`) };
+  assert.throws(() => replaceSourceEntries(previous, f.prepared.map(item => item.entry)), /journal is full/);
+  let checkpoints = 0, deletes = 0;
+  const catalog = await replaceSourceWithCheckpoint(previous, f.prepared.map(item => item.entry), async current => {
+    checkpoints++;
+    return publishPrepared(current, [], f.put, f.verify, {
+      remove: async key => { deletes++; f.objects.delete(key); }, readCatalog: f.readCatalog,
+    });
+  });
+  assert.equal(checkpoints, 1); assert.equal(deletes, MAX_PENDING_DELETIONS);
+  assert.deepEqual(catalog.pendingDeletionKeys, [f.entries[0].key]);
+  await publishPrepared(catalog, f.prepared, f.put, f.verify, { remove: async key => { f.objects.delete(key); }, readCatalog: f.readCatalog });
+  assert.equal(f.current().pendingDeletionKeys, undefined);
+});
+
+test("reactivated exports leave the journal and never become cleanup candidates", () => {
+  const f = fixture(1);
+  const catalog = replaceSourceEntries({ schema: "reddit-insights.catalog.v1", entries: [], pendingDeletionKeys: [f.entries[0].key] }, f.entries);
+  assert.equal(catalog.pendingDeletionKeys, undefined);
+  assert.deepEqual(catalog.entries, f.entries);
 });

@@ -13,6 +13,11 @@ export function archivePrefix(entry) {
   return `reddit/v2/run=${entry.source.run}/attempt=${entry.source.attempt}/date=${entry.date}`;
 }
 
+export function validDeletionKey(key) {
+  const match = typeof key === "string" && /^snapshots\/(\d{4}-\d{2}-\d{2})\/[A-Za-z0-9_]{2,30}\/[1-9][0-9]*-[a-f0-9]{64}\.json\.gz$/.exec(key);
+  return Boolean(match && validDate(match[1]));
+}
+
 export function verifyCatalog(catalog) {
   if (catalog.schema !== "reddit-insights.catalog.v1" || !Array.isArray(catalog.entries)) throw new Error("Invalid export catalog");
   const keys = new Set();
@@ -26,8 +31,7 @@ export function verifyCatalog(catalog) {
   const pending = catalog.pendingDeletionKeys ?? [];
   if (!Array.isArray(pending) || pending.length > MAX_PENDING_DELETIONS || new Set(pending).size !== pending.length) throw new Error("Invalid pending deletion journal");
   for (const key of pending) {
-    const match = typeof key === "string" && /^snapshots\/(\d{4}-\d{2}-\d{2})\/[A-Za-z0-9_]{2,30}\/[1-9][0-9]*-[a-f0-9]{64}\.json\.gz$/.exec(key);
-    if (!match || !validDate(match[1]) || keys.has(key)) throw new Error("Deletion journal contains an invalid or active export key");
+    if (!validDeletionKey(key) || keys.has(key)) throw new Error("Deletion journal contains an invalid or active export key");
   }
   return catalog;
 }
@@ -50,12 +54,25 @@ export function replaceSourceEntries(catalog, entries) {
   const next = [...catalog.entries.filter(entry => !prefixes.has(archivePrefix(entry))), ...entries];
   const active = new Set(next.map(entry => entry.key));
   const retired = catalog.entries.filter(entry => !active.has(entry.key)).map(entry => entry.key);
-  const pending = [...new Set([...(catalog.pendingDeletionKeys || []), ...retired])];
-  return verifyCatalog({ ...catalog, entries: next, ...(pending.length ? { pendingDeletionKeys: pending } : {}) });
+  const pending = [...new Set([...(catalog.pendingDeletionKeys || []), ...retired])].filter(key => !active.has(key));
+  if (pending.length > MAX_PENDING_DELETIONS) throw Object.assign(new Error("Revoked export journal is full; run publisher with --delete-revoked to checkpoint bounded cleanup"), { code: "pending_deletion_limit" });
+  const result = { ...catalog, entries: next };
+  if (pending.length) result.pendingDeletionKeys = pending;
+  else delete result.pendingDeletionKeys;
+  return verifyCatalog(result);
 }
 
 export function replaceSource(catalog, prepared) {
   return replaceSourceEntries(catalog, prepared.map(item => item.entry));
+}
+
+/** Explicit cleanup can checkpoint prior work before adding another bounded source. */
+export async function replaceSourceWithCheckpoint(catalog, entries, checkpoint) {
+  try { return replaceSourceEntries(catalog, entries); }
+  catch (error) {
+    if (error.code !== "pending_deletion_limit" || !checkpoint) throw error;
+    return replaceSourceEntries(await checkpoint(catalog), entries);
+  }
 }
 
 /** Lease renewal is permitted only after rereading the authoritative manifest. */

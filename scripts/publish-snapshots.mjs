@@ -7,8 +7,8 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadArchive, sha256 } from "./snapshots/archive.mjs";
-import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, replaceSourceEntries, renewSource, refreshSourceExports, publishPrepared } from "./snapshots/publication.mjs";
-import { createWranglerRunner } from "./snapshots/wrangler-client.mjs";
+import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSourceWithCheckpoint, renewSource, refreshSourceExports, publishPrepared } from "./snapshots/publication.mjs";
+import { createWranglerRunner, createRevocationHooks } from "./snapshots/wrangler-client.mjs";
 
 const exec = promisify(execFile);
 const { values } = parseArgs({ options: {
@@ -20,6 +20,7 @@ const { values } = parseArgs({ options: {
 if (!values["archive-dir"]?.length && !values["refresh-only"]) throw new Error("Provide --archive-dir or --refresh-only");
 if (values["rebuild-existing"] && !values["refresh-only"]) throw new Error("Rebuild requires an explicit refresh-only recovery");
 if (values.bucket !== "reddit-insights-archive") throw new Error("Publisher is scoped to the private Reddit Insights derivative bucket");
+if (values["delete-revoked"]) throw new Error("Physical cleanup is unavailable: an enforced exclusive publication transport is required");
 const work = await mkdtemp(join(tmpdir(), "reddit-snapshot-publication-"));
 const now = Date.now();
 let serial = 0, uploads = 0;
@@ -54,6 +55,22 @@ try {
   if (existingBytes && existingBytes.length > 4 * 1024 * 1024) throw new Error("Catalog exceeds serving limit");
   let catalog = verifyCatalog(existingBytes ? JSON.parse(existingBytes) : { schema: "reddit-insights.catalog.v1", entries: [] });
   const prepared = [], updated = new Set();
+  const hooks = createRevocationHooks(values["delete-revoked"], {
+    bucket: values.bucket, run: wrangler,
+    readCatalog: () => get(values.bucket, EXPORT_PREFIX + "index.json", join(work, `deletion-receipt-${serial++}.json`)),
+  });
+  const checkpoint = async current => {
+    const result = await publishPrepared(current, prepared, put, async item => {
+      const bytes = await get(values.bucket, EXPORT_PREFIX + item.entry.key, join(work, "verified-canary.json.gz"));
+      if (bytes.length !== item.entry.bytes || sha256(bytes) !== item.entry.sha256) throw new Error("Published derivative readback failed");
+    }, hooks);
+    prepared.length = 0;
+    return result;
+  };
+  if (values["delete-revoked"] && catalog.pendingDeletionKeys?.length) catalog = await checkpoint(catalog);
+  const stage = async entries => {
+    catalog = await replaceSourceWithCheckpoint(catalog, entries, values["delete-revoked"] ? checkpoint : undefined);
+  };
   for (const directory of values["archive-dir"] || []) {
     const snapshots = await loadArchive(resolve(directory));
     // Recheck the actual R2 manifest before publishing any locally prepared archive.
@@ -61,7 +78,7 @@ try {
     const authoritative = await get("high-signal-reddit-archive", `${prefix}/manifest.json`, join(work, `source-${serial++}.json`));
     if (sha256(authoritative) !== snapshots[0].source.revision) throw new Error("Authoritative source changed; download and reverify it before publication");
     const items = prepareSnapshots(snapshots, now);
-    catalog = replaceSource(catalog, items); prepared.push(...items); updated.add(prefix);
+    await stage(items.map(item => item.entry)); prepared.push(...items); updated.add(prefix);
   }
   // Always discover the complete canonical latest run. A queued refresh/redaction
   // job can then recover a collection even if its own publish job was superseded.
@@ -75,7 +92,7 @@ try {
     const entries = catalog.entries.filter(entry => archivePrefix(entry) === latestPrefix);
     if (values["rebuild-existing"] || !renewSource(entries, manifest, now)) {
       const items = prepareSnapshots(await downloadArchive(latestPrefix, directory, manifest), now);
-      catalog = replaceSource(catalog, items); prepared.push(...items); updated.add(latestPrefix);
+      await stage(items.map(item => item.entry)); prepared.push(...items); updated.add(latestPrefix);
     }
   }
   const groups = new Map();
@@ -93,18 +110,12 @@ try {
     const refreshed = await refreshSourceExports(entries, manifest,
       () => downloadArchive(prefix, directory, manifest),
       entry => get(values.bucket, EXPORT_PREFIX + entry.key, join(work, `retouch-${serial++}`), true), now, { rebuildExisting: values["rebuild-existing"] });
-    catalog = replaceSourceEntries(catalog, refreshed.entries);
+    await stage(refreshed.entries);
     prepared.push(...refreshed.prepared);
   }
   catalog.generatedAt = new Date(now).toISOString();
   catalog.entries.sort((a, b) => b.date.localeCompare(a.date) || b.capturedAt.localeCompare(a.capturedAt) || a.subreddit.localeCompare(b.subreddit));
-  catalog = await publishPrepared(catalog, prepared, put, async item => {
-    const bytes = await get(values.bucket, EXPORT_PREFIX + item.entry.key, join(work, "verified-canary.json.gz"));
-    if (bytes.length !== item.entry.bytes || sha256(bytes) !== item.entry.sha256) throw new Error("Published derivative readback failed");
-  }, values["delete-revoked"] ? {
-    remove: key => wrangler(["r2", "object", "delete", `${values.bucket}/${key}`, "--remote"]),
-    readCatalog: () => get(values.bucket, EXPORT_PREFIX + "index.json", join(work, `deletion-receipt-${serial++}.json`)),
-  } : {});
+  catalog = await checkpoint(catalog);
   const receipt = await get(values.bucket, EXPORT_PREFIX + "index.json", join(work, "verified-catalog.json"));
   if (!receipt.equals(Buffer.from(JSON.stringify(catalog)))) throw new Error("Published catalog readback failed");
   console.log(`Pending revoked derivative objects: ${catalog.pendingDeletionKeys?.length || 0}; physical cleanup requires --delete-revoked.`);

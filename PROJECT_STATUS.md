@@ -4,17 +4,22 @@
 
 Snapshot publication records up to 4,096 revoked derivative keys in the private
 catalog. Normal publication preserves that content-free journal without deleting
-objects. The explicit `--delete-revoked` publisher option removes only journaled,
-non-active derivative objects after verifying the published catalog. Interrupted
-cleanup retains the journal for an idempotent retry; raw archive keys are rejected.
-The existing serialized snapshot-publication workflow remains required.
+objects. The `--delete-revoked` CLI fails before remote access: the current
+Wrangler transport has no enforced cross-publisher exclusion. Catalog readback
+alone cannot prevent a concurrent publisher from reactivating a key before deletion.
+The cleanup engine requires an exclusive transport before production integration.
+Its bounded checkpoint path drains a full journal before adding new replacements;
+reactivated keys are removed from the journal. A full journal without cleanup
+fails publication explicitly rather than silently losing deletion obligations.
 
-Synthetic storage tests cover redacted source projection, replacement publication,
-physical old-export removal, revoked pinned downloads, sanitized JSON/CSV, failed
-readback/deletion and retries. Production cleanup has not been activated, and the
+Synthetic exclusive-storage tests cover redacted source projection, replacement
+publication, physical old-export removal, revoked pinned downloads, sanitized
+JSON/CSV, failed readback/deletion, retries, and the journal limit. CLI tests prove
+that production deletion fails closed. Production deletion is unavailable and the
 48-hour deletion acceptance remains unqualified. Previously orphaned derivatives
-are not discovered by this journal. Collector/raw-archive ownership, historical
-redaction and authorization remain open in [#44](https://github.com/sarthakagrawal927/research-subreddit/issues/44).
+are not discovered by this journal. Enforced publication exclusion, collector/raw-
+archive ownership, historical redaction and authorization remain open in
+[#44](https://github.com/sarthakagrawal927/research-subreddit/issues/44).
 
 ## Prior deployed snapshot release
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createWranglerRunner } from "./wrangler-client.mjs";
+import { createWranglerRunner, createRevocationHooks } from "./wrangler-client.mjs";
 
 test("concurrent storage calls share one pinned CLI resolution and version check", async () => {
   const calls = [], binary = "/tmp/pinned-wrangler/bin/wrangler", cwd = "/tmp/publication";
@@ -39,4 +39,39 @@ test("invalid paths, wrong versions and resolution errors cannot start storage o
     assert.equal(resolutions, 1);
     assert.equal(operations, 0);
   }
+});
+
+
+test("physical cleanup is opt-in and emits only scoped remote object deletion", async () => {
+  const key = `reddit-insights/exports/v1/snapshots/2026-10-01/Cloud/12-${"a".repeat(64)}.json.gz`;
+  const calls = [], readCatalog = async () => Buffer.from("receipt");
+  const options = { bucket: "reddit-insights-archive", run: async args => { calls.push(args); }, readCatalog };
+  assert.deepEqual(createRevocationHooks(false, options), {});
+  assert.deepEqual(calls, []);
+  const hooks = createRevocationHooks(true, options);
+  assert.equal(hooks.readCatalog, readCatalog);
+  await hooks.remove(key);
+  assert.deepEqual(calls, [["r2", "object", "delete", `reddit-insights-archive/${key}`, "--remote"]]);
+  assert.throws(() => createRevocationHooks(true, { ...options, bucket: "high-signal-reddit-archive" }), /derivative bucket/);
+  for (const bad of ["reddit/v2/raw", "reddit-insights/exports/v1/index.json", "reddit-insights/exports/v1/snapshots/../../raw"]) await assert.rejects(hooks.remove(bad), /derivative export/);
+});
+
+test("cleanup retries accept only explicit missing-object errors and preserve authorization failures", async () => {
+  const key = `reddit-insights/exports/v1/snapshots/2026-10-01/Cloud/12-${"a".repeat(64)}.json.gz`;
+  for (const message of ["NoSuchKey", "Object missing [code: 10007]"]) {
+    const hooks = createRevocationHooks(true, { bucket: "reddit-insights-archive", run: async () => { throw new Error(message); } });
+    await hooks.remove(key);
+  }
+  for (const message of ["permission denied 10007", "authentication failed", "10042", "Network error", "bucket not found"]) {
+    const hooks = createRevocationHooks(true, { bucket: "reddit-insights-archive", run: async () => { throw new Error(message); } });
+    await assert.rejects(hooks.remove(key), error => error.message === message);
+  }
+});
+
+// The current remote transport cannot exclude another catalog publisher.
+test("production cleanup fails closed before provider access", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync(process.execPath, ["scripts/publish-snapshots.mjs", "--refresh-only", "--delete-revoked"], { encoding: "utf8", env: { PATH: "" } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /enforced exclusive publication transport is required/);
 });
