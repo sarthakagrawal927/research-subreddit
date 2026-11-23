@@ -5,6 +5,43 @@ import { validDate } from "./viewer/paths.mjs";
 export const EXPORT_PREFIX = "reddit-insights/exports/v1/";
 export const LEASE_MS = 86400000;
 export const RETOUCH_MS = 5 * LEASE_MS;
+export const MAX_PUBLISH_CONCURRENCY = 8;
+
+/** Wait for every started operation before surfacing the first failure. */
+export async function settleAll(operations) {
+  const results = await Promise.allSettled(operations);
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) throw failed.reason;
+  return results.map(result => result.value);
+}
+
+/** Run independent archive-prefix work in bounded batches, retaining input order. */
+export async function mapSettledBatches(items, concurrency, mapper) {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("Invalid batch concurrency");
+  const results = [];
+  for (let start = 0; start < items.length; start += concurrency) {
+    results.push(...await settleAll(items.slice(start, start + concurrency).map(mapper)));
+  }
+  return results;
+}
+
+/** Bound concurrent storage reads across overlapping archive-prefix work. */
+export function createLimiter(limit) {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid concurrency limit");
+  let active = 0;
+  const waiting = [];
+  return async task => {
+    if (active < limit) active++;
+    else await new Promise(resolve => waiting.push(resolve));
+    try {
+      return await task();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
+    }
+  };
+}
 
 export function archivePrefix(entry) {
   if (!validDate(entry.date) || !/^[1-9][0-9]*$/.test(entry.source?.run || "") || !/^[1-9][0-9]*$/.test(entry.source?.attempt || "")) throw new Error("Invalid source archive identity");
@@ -87,8 +124,8 @@ export async function refreshSourceExports(entries, manifestBytes, load, read, n
 /** Catalog is committed last; interrupted object uploads cannot switch readers. */
 export async function publishPrepared(catalog, prepared, put, verify) {
   verifyCatalog(catalog);
-  for (let start = 0; start < prepared.length; start += 4) {
-    const results = await Promise.allSettled(prepared.slice(start, start + 4).map(item => put(EXPORT_PREFIX + item.entry.key, item.bytes)));
+  for (let start = 0; start < prepared.length; start += MAX_PUBLISH_CONCURRENCY) {
+    const results = await Promise.allSettled(prepared.slice(start, start + MAX_PUBLISH_CONCURRENCY).map(item => put(EXPORT_PREFIX + item.entry.key, item.bytes)));
     const failed = results.find(result => result.status === "rejected");
     if (failed) throw failed.reason;
   }

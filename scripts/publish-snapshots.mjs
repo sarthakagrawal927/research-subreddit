@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadArchive, sha256 } from "./snapshots/archive.mjs";
-import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, renewSource, refreshSourceExports, publishPrepared } from "./snapshots/publication.mjs";
+import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, renewSource, refreshSourceExports, publishPrepared, mapSettledBatches, createLimiter, settleAll } from "./snapshots/publication.mjs";
 import { createWranglerRunner } from "./snapshots/wrangler-client.mjs";
 
 const exec = promisify(execFile);
@@ -23,16 +23,19 @@ const work = await mkdtemp(join(tmpdir(), "reddit-snapshot-publication-"));
 const now = Date.now();
 let serial = 0, uploads = 0;
 const runWrangler = createWranglerRunner(exec, work);
+const withGetLimit = createLimiter(8);
 async function wrangler(args) {
   try { return await runWrangler(args); }
   catch (error) { throw new Error(`Cloudflare operation failed: ${(error.stderr || error.stdout || error.message).slice(-2000)}`); }
 }
 async function get(bucket, key, path, allowMissing = false) {
-  try { await wrangler(["r2", "object", "get", `${bucket}/${key}`, "--file", path, "--remote"]); return await readFile(path); }
-  catch (error) {
-    if (allowMissing && /(?:NoSuchKey|does not exist|not found|\b10007\b)/i.test(error.message) && !/10042|authentication|permission/i.test(error.message)) return null;
-    throw error;
-  }
+  return withGetLimit(async () => {
+    try { await wrangler(["r2", "object", "get", `${bucket}/${key}`, "--file", path, "--remote"]); return await readFile(path); }
+    catch (error) {
+      if (allowMissing && /(?:NoSuchKey|does not exist|not found|\b10007\b)/i.test(error.message) && !/10042|authentication|permission/i.test(error.message)) return null;
+      throw error;
+    }
+  });
 }
 async function put(key, bytes) {
   const path = join(work, `upload-${serial++}`);
@@ -44,7 +47,7 @@ async function put(key, bytes) {
 async function downloadArchive(prefix, directory, manifestBytes) {
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, "manifest.json"), manifestBytes);
-  await Promise.all(["subreddits.index.json", "posts.jsonl.zst", "comments.jsonl.zst", "events.jsonl.zst"].map(file => get("high-signal-reddit-archive", `${prefix}/${file}`, join(directory, file))));
+  await settleAll(["subreddits.index.json", "posts.jsonl.zst", "comments.jsonl.zst", "events.jsonl.zst"].map(file => get("high-signal-reddit-archive", `${prefix}/${file}`, join(directory, file))));
   return loadArchive(directory);
 }
 
@@ -84,7 +87,7 @@ try {
     if (!groups.has(prefix)) groups.set(prefix, []);
     groups.get(prefix).push(entry);
   }
-  for (const [prefix, entries] of groups) {
+  const refreshedGroups = await mapSettledBatches([...groups], 2, async ([prefix, entries]) => {
     const directory = join(work, `archive-${serial++}`);
     await mkdir(directory);
     // A missing/unreadable source fails this publication; no lease is silently extended.
@@ -92,7 +95,10 @@ try {
     const refreshed = await refreshSourceExports(entries, manifest,
       () => downloadArchive(prefix, directory, manifest),
       entry => get(values.bucket, EXPORT_PREFIX + entry.key, join(work, `retouch-${serial++}`), true), now, { rebuildExisting: values["rebuild-existing"] });
-    catalog.entries = [...catalog.entries.filter(entry => archivePrefix(entry) !== prefix), ...refreshed.entries];
+    return { prefix, entries: refreshed.entries, prepared: refreshed.prepared };
+  });
+  for (const refreshed of refreshedGroups) {
+    catalog.entries = [...catalog.entries.filter(entry => archivePrefix(entry) !== refreshed.prefix), ...refreshed.entries];
     prepared.push(...refreshed.prepared);
   }
   catalog.generatedAt = new Date(now).toISOString();
