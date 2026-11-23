@@ -7,15 +7,20 @@ export const LEASE_MS = 86400000;
 export const RETOUCH_MS = 5 * LEASE_MS;
 export const MAX_PUBLISH_CONCURRENCY = 8;
 
+/** Wait for every started operation before surfacing the first failure. */
+export async function settleAll(operations) {
+  const results = await Promise.allSettled(operations);
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) throw failed.reason;
+  return results.map(result => result.value);
+}
+
 /** Run independent archive-prefix work in bounded batches, retaining input order. */
 export async function mapSettledBatches(items, concurrency, mapper) {
   if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("Invalid batch concurrency");
   const results = [];
   for (let start = 0; start < items.length; start += concurrency) {
-    const settled = await Promise.allSettled(items.slice(start, start + concurrency).map(mapper));
-    const failed = settled.find(result => result.status === "rejected");
-    if (failed) throw failed.reason;
-    results.push(...settled.map(result => result.value));
+    results.push(...await settleAll(items.slice(start, start + concurrency).map(mapper)));
   }
   return results;
 }
@@ -26,13 +31,14 @@ export function createLimiter(limit) {
   let active = 0;
   const waiting = [];
   return async task => {
-    if (active >= limit) await new Promise(resolve => waiting.push(resolve));
-    active++;
+    if (active < limit) active++;
+    else await new Promise(resolve => waiting.push(resolve));
     try {
       return await task();
     } finally {
-      active--;
-      waiting.shift()?.();
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
     }
   };
 }

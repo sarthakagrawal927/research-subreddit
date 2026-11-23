@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { sha256 } from "./archive.mjs";
-import { archivePrefix, renewSource, replaceSource, refreshSourceExports, publishPrepared, EXPORT_PREFIX, mapSettledBatches, createLimiter, MAX_PUBLISH_CONCURRENCY } from "./publication.mjs";
+import { archivePrefix, renewSource, replaceSource, refreshSourceExports, publishPrepared, EXPORT_PREFIX, mapSettledBatches, createLimiter, MAX_PUBLISH_CONCURRENCY, settleAll } from "./publication.mjs";
 
 const source = { run: "12", attempt: "1", revision: "a".repeat(64) };
 const bytes = gzipSync("{}");
@@ -43,6 +43,35 @@ test("overlapping prefix work shares one bounded storage-read budget", async () 
   })));
   assert.equal(peak, 8);
   assert.throws(() => createLimiter(0), /concurrency limit/);
+});
+
+test("the read limiter transfers a released slot to a queued caller", async () => {
+  const withLimit = createLimiter(1);
+  let active = 0, peak = 0, releaseFirst;
+  const run = async () => {
+    active++; peak = Math.max(peak, active);
+    await new Promise(resolve => setImmediate(resolve));
+    active--;
+  };
+  const first = withLimit(async () => {
+    active++; peak = Math.max(peak, active);
+    await new Promise(resolve => { releaseFirst = resolve; });
+    active--;
+  });
+  const second = withLimit(run);
+  releaseFirst();
+  const third = withLimit(run);
+  await Promise.all([first, second, third]);
+  assert.equal(peak, 1);
+});
+
+test("settled archive reads finish before the first failure is surfaced", async () => {
+  const completed = [];
+  await assert.rejects(settleAll([
+    Promise.resolve().then(() => { throw new Error("archive permission denied"); }),
+    new Promise(resolve => setTimeout(() => { completed.push("read"); resolve(); }, 5)),
+  ]), /archive permission denied/);
+  assert.deepEqual(completed, ["read"]);
 });
 
 test("publication rejects arbitrary archive identities and renews only unchanged authoritative receipts", () => {

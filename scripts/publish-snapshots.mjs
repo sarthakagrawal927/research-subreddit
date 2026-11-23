@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadArchive, sha256 } from "./snapshots/archive.mjs";
-import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, renewSource, refreshSourceExports, publishPrepared, mapSettledBatches, createLimiter } from "./snapshots/publication.mjs";
+import { EXPORT_PREFIX, archivePrefix, prepareSnapshots, verifyCatalog, replaceSource, renewSource, refreshSourceExports, publishPrepared, mapSettledBatches, createLimiter, settleAll } from "./snapshots/publication.mjs";
 import { createWranglerRunner } from "./snapshots/wrangler-client.mjs";
 
 const exec = promisify(execFile);
@@ -47,7 +47,7 @@ async function put(key, bytes) {
 async function downloadArchive(prefix, directory, manifestBytes) {
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, "manifest.json"), manifestBytes);
-  await Promise.all(["subreddits.index.json", "posts.jsonl.zst", "comments.jsonl.zst", "events.jsonl.zst"].map(file => get("high-signal-reddit-archive", `${prefix}/${file}`, join(directory, file))));
+  await settleAll(["subreddits.index.json", "posts.jsonl.zst", "comments.jsonl.zst", "events.jsonl.zst"].map(file => get("high-signal-reddit-archive", `${prefix}/${file}`, join(directory, file))));
   return loadArchive(directory);
 }
 
