@@ -60,6 +60,8 @@ test("the read limiter transfers a released slot to a queued caller", async () =
   });
   const second = withLimit(run);
   releaseFirst();
+  await Promise.resolve();
+  await Promise.resolve();
   const third = withLimit(run);
   await Promise.all([first, second, third]);
   assert.equal(peak, 1);
